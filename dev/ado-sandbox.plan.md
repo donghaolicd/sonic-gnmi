@@ -381,19 +381,20 @@ The hard ADO parts and how C handles them:
 ### Epic 3 — Container + setup-test-env + Artifact Stubs
 **Goal:** Reproduce the SONiC-dependent test jobs in the slave container.
 **Prerequisites:** Epic 2; slave image + artifact cache available.
+**Status: DONE**
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E3-T1 | IMPL | `docker run` orchestration: image from config, mounts (repo + siblings + cache + results), proxy env, `--ulimit`, one container per job | `dev/ado_sandbox/executor.py` | TO DO |
-| E3-T2 | IMPL | `DownloadPipelineArtifact@2` stub: copy from `artifact_cache.<artifact>` by `patterns`; `--allow-missing-artifacts` warn mode | `dev/ado_sandbox/tasks.py` | TO DO |
-| E3-T3 | IMPL | `dev/sandbox.yaml` schema + loading + `--var`/`--config` overrides | `dev/ado_sandbox/__init__.py`, `dev/sandbox.yaml` | TO DO |
-| E3-T4 | IMPL | `--shell` interactive mode | `dev/ado_sandbox/executor.py` | TO DO |
-| E3-T5 | TEST | `integration_tests` + `memleak_tests` run green in container with a populated cache (documented manual/integration test) | `dev/tests/test_resolver.py`, `dev/README.md` | TO DO |
+| E3-T1 | IMPL | `docker run` orchestration: image from config, mounts (repo + siblings + cache + results), proxy env, `--ulimit`, one container per job | `dev/ado_sandbox/executor.py` | DONE |
+| E3-T2 | IMPL | `DownloadPipelineArtifact@2` stub: copy from `artifact_cache.<artifact>` by `patterns`; `--allow-missing-artifacts` warn mode | `dev/ado_sandbox/tasks.py` | DONE |
+| E3-T3 | IMPL | `dev/sandbox.yaml` schema + loading + `--var`/`--config` overrides | `dev/ado_sandbox/__init__.py`, `dev/sandbox.yaml` | DONE |
+| E3-T4 | IMPL | `--shell` interactive mode | `dev/ado_sandbox/executor.py` | DONE |
+| E3-T5 | TEST | `integration_tests` + `memleak_tests` run green in container with a populated cache (documented manual/integration test) | `dev/tests/test_resolver.py`, `dev/README.md` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `dev/ado-sandbox integration_tests` runs `setup-test-env` + `make all` + `make check_gotest_junit` in `sonic-slave-trixie:local` and collects junit + coverage.
-- [ ] Missing artifact → precise error with acquisition hint; `--allow-missing-artifacts` downgrades to warning.
-- [ ] `--shell integration_tests` drops the dev into the prepared container.
+- [x] `dev/ado-sandbox integration_tests` runs `setup-test-env` + `make all` + `make check_gotest_junit` in `sonic-slave-trixie:local` and collects junit + coverage.
+- [x] Missing artifact → precise error with acquisition hint; `--allow-missing-artifacts` downgrades to warning.
+- [x] `--shell integration_tests` drops the dev into the prepared container.
 
 ### Epic 4 — build-deb + Docs + Hardening
 **Goal:** Reproduce packaging and document the workflow.

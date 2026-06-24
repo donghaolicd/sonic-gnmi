@@ -1,21 +1,79 @@
 """ado-sandbox: a dev-only reader/executor for the canonical ADO pipeline YAML.
 
 Epic 1 provides the resolution core and the read-only ``--list`` / ``--dry-run``
-CLI. Execution (Docker / bare-host) is added in later epics.
+CLI; Epic 2 adds the bare-host (``--no-container``) executor. Epic 3 adds the
+container tier: ``docker run`` orchestration, the ``DownloadPipelineArtifact@2``
+artifact-cache stub, the ``dev/sandbox.yaml`` config (image / repos / artifact
+cache / var overrides), and an interactive ``--shell`` mode.
 """
 
 import argparse
 import os
 import sys
 
+import yaml
+
 from . import executor
 from .loader import load_yaml
 from .resolver import list_jobs, resolve_job
 
 
+# Default container image when ``dev/sandbox.yaml`` is absent or omits ``image:``.
+# Overrides the private ACR ref that is not publicly pullable (DD4).
+DEFAULT_IMAGE = "sonic-slave-trixie:local"
+
+
+def _dev_dir():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _default_pipeline_path():
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(repo_root, "azure-pipelines.yml")
+    return os.path.join(os.path.dirname(_dev_dir()), "azure-pipelines.yml")
+
+
+def _default_config_path():
+    return os.path.join(_dev_dir(), "sandbox.yaml")
+
+
+def load_config(path=None):
+    """Load ``dev/sandbox.yaml`` (or ``path``) into a normalised config dict.
+
+    Returns a dict with keys ``image`` / ``repos`` / ``artifact_cache`` /
+    ``vars``. A missing file yields the built-in defaults (so the tool runs with
+    zero local config); ``artifact_cache`` paths are ``~``-expanded. Local-only
+    knowledge lives here, never in the canonical pipeline YAML (DD5).
+    """
+    config = {
+        "image": DEFAULT_IMAGE,
+        "repos": {},
+        "artifact_cache": {},
+        "vars": {},
+    }
+    if path is None:
+        path = _default_config_path()
+    if path and os.path.isfile(path):
+        with open(path, "r") as handle:
+            raw = yaml.safe_load(handle) or {}
+        if raw.get("image"):
+            config["image"] = raw["image"]
+        config["repos"] = dict(raw.get("repos") or {})
+        config["artifact_cache"] = {
+            name: os.path.expanduser(str(value))
+            for name, value in (raw.get("artifact_cache") or {}).items()
+        }
+        config["vars"] = dict(raw.get("vars") or {})
+    return config
+
+
+def merge_vars(config, cli_vars):
+    """Merge variable overrides with CLI ``--var`` taking highest precedence.
+
+    Precedence (highest first): CLI ``--var`` > ``dev/sandbox.yaml: vars`` >
+    (downstream) job / pipeline / built-in pseudo-vars handled by the resolver.
+    """
+    merged = dict(config.get("vars") or {})
+    merged.update(cli_vars or {})
+    return merged
 
 
 def _parse_var(values):
@@ -83,27 +141,42 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="resolve + print steps (no Docker)")
     parser.add_argument("--no-container", action="store_true",
                         help="run the job bare-host (pure_tests, go_static_checks)")
+    parser.add_argument("--shell", action="store_true",
+                        help="drop into an interactive container shell for the job")
+    parser.add_argument("--allow-missing-artifacts", action="store_true",
+                        help="turn DownloadPipelineArtifact stubs into warnings")
     parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
                         help="override a runtime variable (highest precedence)")
+    parser.add_argument("--config", default=None, metavar="PATH",
+                        help="path to sandbox.yaml (default: dev/sandbox.yaml)")
     parser.add_argument("--pipeline", default=None, help="path to azure-pipelines.yml")
     args = parser.parse_args(argv)
 
     pipeline_path = args.pipeline or _default_pipeline_path()
-    cli_vars = _parse_var(args.var)
+    config = load_config(args.config)
+    cli_vars = merge_vars(config, _parse_var(args.var))
 
     if args.list:
         _print_list(pipeline_path, sys.stdout)
         return 0
-    if args.no_container:
-        if not args.job:
-            parser.error("--no-container requires a job argument")
-        return executor.run_job(pipeline_path, args.job, cli_vars,
-                                no_container=True, dry_run=args.dry_run)
     if args.dry_run:
         if not args.job:
             parser.error("--dry-run requires a job argument")
+        if args.no_container:
+            return executor.run_job(pipeline_path, args.job, cli_vars,
+                                    no_container=True, dry_run=True)
         _print_dry_run(pipeline_path, args.job, cli_vars, sys.stdout)
         return 0
+    if args.no_container:
+        if not args.job:
+            parser.error("--no-container requires a job argument")
+        return executor.run_job(pipeline_path, args.job, cli_vars, no_container=True)
+    if args.shell:
+        if not args.job:
+            parser.error("--shell requires a job argument")
+        return executor.run_shell(pipeline_path, args.job, config, cli_vars)
+    if args.job:
+        return executor.run_job(pipeline_path, args.job, cli_vars, config=config,
+                                allow_missing_artifacts=args.allow_missing_artifacts)
 
-    parser.error("nothing to do: pass --list or <job> --dry-run "
-                 "(execution modes are added in later epics)")
+    parser.error("nothing to do: pass --list or <job> [--dry-run|--no-container|--shell]")

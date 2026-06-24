@@ -586,5 +586,214 @@ def test_real_pure_tests_end_to_end():
     assert os.path.exists(results)
 
 
+# ==========================================================================
+# Epic 3 -- Container + setup-test-env + artifact stubs
+# ==========================================================================
+HAVE_DOCKER = bool(shutil.which("docker"))
+
+
+# --------------------------------------------------------------------------
+# E3-T3: sandbox.yaml schema + loading + --var/--config precedence
+# --------------------------------------------------------------------------
+def test_load_config_defaults_when_file_absent(tmp_path):
+    cfg = ado_sandbox.load_config(str(tmp_path / "nope.yaml"))
+    assert cfg["image"] == ado_sandbox.DEFAULT_IMAGE
+    assert cfg["vars"] == {}
+    assert cfg["artifact_cache"] == {}
+    assert cfg["repos"] == {}
+
+
+def test_load_config_reads_file_and_expands_user(tmp_path):
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(
+        "image: my-image:local\n"
+        "repos:\n"
+        "  sonic-mgmt-common: ../sonic-mgmt-common\n"
+        "artifact_cache:\n"
+        "  common-lib: ~/.cache/sonic-gnmi-sandbox/common-lib\n"
+        "vars:\n"
+        "  BUILD_BRANCH: master\n"
+    )
+    cfg = ado_sandbox.load_config(str(cfg_path))
+    assert cfg["image"] == "my-image:local"
+    assert cfg["repos"]["sonic-mgmt-common"] == "../sonic-mgmt-common"
+    assert cfg["artifact_cache"]["common-lib"] == os.path.expanduser(
+        "~/.cache/sonic-gnmi-sandbox/common-lib")
+    assert cfg["vars"]["BUILD_BRANCH"] == "master"
+
+
+def test_default_sandbox_yaml_is_present_and_valid():
+    cfg = ado_sandbox.load_config()  # default dev/sandbox.yaml
+    assert cfg["image"] == "sonic-slave-trixie:local"
+    for name in ("common-lib", "sonic-buildimage.vs", "sonic-swss-common-trixie"):
+        assert name in cfg["artifact_cache"]
+
+
+def test_merge_vars_cli_overrides_config():
+    cfg = {"vars": {"BUILD_BRANCH": "master", "X": "1"}}
+    merged = ado_sandbox.merge_vars(cfg, {"BUILD_BRANCH": "feature"})
+    assert merged["BUILD_BRANCH"] == "feature"  # CLI wins
+    assert merged["X"] == "1"                    # config retained
+
+
+# --------------------------------------------------------------------------
+# E3-T1: docker run command construction (mounts, ulimit, proxy, image)
+# --------------------------------------------------------------------------
+def test_build_docker_command_script_mode():
+    cmd = executor.build_docker_command(
+        "img:local", [("/work", "/work", "rw")], {}, ["nofile=1024:1024"],
+        "/work", script_path="/job.sh")
+    assert cmd[:3] == ["docker", "run", "--rm"]
+    assert "-it" not in cmd
+    assert "-v" in cmd and "/work:/work:rw" in cmd
+    assert "--ulimit" in cmd and "nofile=1024:1024" in cmd
+    assert cmd[-3:] == ["img:local", "bash", "/job.sh"]
+
+
+def test_build_docker_command_interactive_mode():
+    cmd = executor.build_docker_command(
+        "img:local", [("/work", "/work", "rw")], {}, [], "/work", interactive=True)
+    assert "-it" in cmd
+    assert cmd[-2:] == ["img:local", "/bin/bash"]
+
+
+def test_build_docker_command_forwards_env():
+    cmd = executor.build_docker_command(
+        "img:local", [], {"http_proxy": "http://p:8080"}, [], "/work",
+        script_path="/job.sh")
+    joined = " ".join(cmd)
+    assert "-e" in cmd
+    assert "http_proxy=http://p:8080" in joined
+
+
+def test_proxy_env_selects_known_vars():
+    env = {"http_proxy": "http://p", "PATH": "/bin", "HTTPS_PROXY": "http://q"}
+    forwarded = executor._proxy_env(env)
+    assert forwarded == {"http_proxy": "http://p", "HTTPS_PROXY": "http://q"}
+
+
+# --------------------------------------------------------------------------
+# E3-T2: DownloadPipelineArtifact@2 stub (copy by patterns / missing handling)
+# --------------------------------------------------------------------------
+def _download_step(artifact, patterns=None, path=None):
+    inputs = {"artifact": artifact}
+    if patterns is not None:
+        inputs["patterns"] = patterns
+    if path is not None:
+        inputs["path"] = path
+    return resolver.Step(kind="task", task="DownloadPipelineArtifact@2", inputs=inputs)
+
+
+def test_download_artifact_copies_by_patterns(tmp_path):
+    cache = tmp_path / "cache"
+    debs = cache / "target" / "debs" / "trixie"
+    debs.mkdir(parents=True)
+    (debs / "libyang3_1.deb").write_text("a")
+    (debs / "ignore.txt").write_text("b")
+    target = tmp_path / "download"
+    config = {"artifact_cache": {"common-lib": str(cache)}}
+    step = _download_step("common-lib",
+                          patterns="target/debs/trixie/libyang3_*.deb",
+                          path=str(target))
+    ok = tasks.download_artifact(step, config, str(tmp_path), io.StringIO())
+    assert ok is True
+    assert (target / "target" / "debs" / "trixie" / "libyang3_1.deb").exists()
+    assert not (target / "target" / "debs" / "trixie" / "ignore.txt").exists()
+
+
+def test_download_artifact_copies_all_when_no_patterns(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "libswsscommon_1.0.0_amd64.deb").write_text("x")
+    target = tmp_path / "ws"
+    config = {"artifact_cache": {"sonic-swss-common-trixie": str(cache)}}
+    step = _download_step("sonic-swss-common-trixie")
+    tasks.download_artifact(step, config, str(target), io.StringIO())
+    assert (target / "libswsscommon_1.0.0_amd64.deb").exists()
+
+
+def test_download_artifact_missing_raises_with_hint(tmp_path):
+    config = {"artifact_cache": {}}
+    step = _download_step("common-lib", path=str(tmp_path / "d"))
+    with pytest.raises(tasks.ArtifactCacheError) as exc:
+        tasks.download_artifact(step, config, str(tmp_path), io.StringIO())
+    msg = str(exc.value)
+    assert "common-lib" in msg
+    assert "az pipelines runs artifact download" in msg
+    assert "--allow-missing-artifacts" in msg
+
+
+def test_download_artifact_missing_allows_warn(tmp_path):
+    config = {"artifact_cache": {}}
+    log = io.StringIO()
+    step = _download_step("common-lib", path=str(tmp_path / "d"))
+    ok = tasks.download_artifact(step, config, str(tmp_path), log,
+                                allow_missing=True)
+    assert ok is False
+    assert "WARNING" in log.getvalue()
+
+
+# --------------------------------------------------------------------------
+# E3-T1: prepare_container_job plan (image, mounts, script, download steps)
+# --------------------------------------------------------------------------
+def test_prepare_container_job_plan_for_integration_tests():
+    config = {"image": "sonic-slave-trixie:local", "artifact_cache": {}, "vars": {}}
+    plan = executor.prepare_container_job(PIPELINE, "integration_tests", config,
+                                          stream=io.StringIO())
+    assert plan.image == "sonic-slave-trixie:local"
+    # integration_tests checks out self + two siblings -> working dir is the parent.
+    assert plan.working_dir == os.path.dirname(REPO_ROOT)
+    # repo/siblings/results all live under a single rw working-dir mount.
+    assert (plan.working_dir, plan.working_dir, "rw") in plan.mounts
+    # the three ADO-only artifacts become download steps run before the script.
+    assert len(plan.download_steps) == 3
+    assert "make all" in plan.script
+    assert "check_gotest_junit" in plan.script
+
+
+def test_container_dry_run_emits_docker_command_and_script(capsys):
+    config = {"image": "sonic-slave-trixie:local", "artifact_cache": {}, "vars": {}}
+    rc = executor.run_job(PIPELINE, "memleak_tests", config=config, dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "docker run --rm" in out
+    assert "sonic-slave-trixie:local" in out
+    assert "check_memleak_junit" in out
+
+
+# --------------------------------------------------------------------------
+# E3-T4: --shell interactive mode resolves env+mounts and runs docker -it bash
+# --------------------------------------------------------------------------
+def test_shell_dry_run_builds_interactive_command(capsys):
+    config = {"image": "sonic-slave-trixie:local", "artifact_cache": {}, "vars": {}}
+    cmd = executor.run_shell(PIPELINE, "integration_tests", config, dry_run=True)
+    assert cmd[:3] == ["docker", "run", "--rm"]
+    assert "-it" in cmd
+    assert cmd[-2:] == ["sonic-slave-trixie:local", "/bin/bash"]
+    out = capsys.readouterr().out
+    assert "docker run --rm" in out and "/bin/bash" in out
+
+
+# --------------------------------------------------------------------------
+# E3-T5: opt-in real container runs (requires Docker + populated cache + image)
+#
+# Manual / integration test (documented in dev/README.md): with the
+# sonic-slave-trixie:local image built and dev/sandbox.yaml artifact_cache
+# populated, the following reproduce the SONiC-dependent CI jobs and collect
+# junit + coverage into dev/build-out/results/.
+#   ADO_SANDBOX_E2E_CONTAINER=1 python3 -m pytest dev/tests/test_resolver.py \
+#       -k container_end_to_end
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(not (HAVE_DOCKER and os.environ.get("ADO_SANDBOX_E2E_CONTAINER")),
+                    reason="set ADO_SANDBOX_E2E_CONTAINER=1 (Docker + image + cache) "
+                           "to run the real container job")
+def test_integration_tests_container_end_to_end():
+    config = ado_sandbox.load_config()
+    rc = executor.run_job(PIPELINE, "integration_tests", config=config)
+    results = os.path.join(REPO_ROOT, "dev", "build-out", "results")
+    assert rc == 0
+    assert os.path.isdir(results)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

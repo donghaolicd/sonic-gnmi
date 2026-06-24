@@ -1,0 +1,31 @@
+# ado-sandbox developer configuration (dev-only; never read by CI).
+#
+# This is the *only* place local-only knowledge lives: the container image to
+# run, where the sibling repositories are checked out, where the three ADO-only
+# artifacts have been cached, and any runtime variable overrides. The canonical
+# azure-pipelines.yml / .azure/templates/*.yml are never modified.
+
+# Container image used for the SONiC-dependent jobs. Overrides the private ACR
+# reference `sonicdev-microsoft.azurecr.io:443/sonic-slave-trixie:latest`, which
+# is not publicly pullable -- build it locally from sonic-buildimage and tag it.
+image: sonic-slave-trixie:local
+
+# Local working copies of the repositories checked out alongside `self`.
+# Defaults follow ADO's side-by-side layout (`../<name>`); override if your
+# clones live elsewhere.
+repos:
+  sonic-mgmt-common: ../sonic-mgmt-common
+  sonic-swss-common: ../sonic-swss-common
+
+# Local cache directories for the three ADO-only DownloadPipelineArtifact@2
+# artifacts (no public download URL). Populate these once (see dev/README.md);
+# the DownloadPipelineArtifact@2 stub copies matching files out of them.
+artifact_cache:
+  common-lib: ~/.cache/sonic-gnmi-sandbox/common-lib
+  sonic-buildimage.vs: ~/.cache/sonic-gnmi-sandbox/vs
+  sonic-swss-common-trixie: ~/.cache/sonic-gnmi-sandbox/swsscommon
+
+# Runtime variable overrides (precedence below CLI `--var`, above the built-in
+# pseudo-var table).
+vars:
+  BUILD_BRANCH: master
