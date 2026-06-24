@@ -23,6 +23,7 @@ call (Epic 2/3 acceptance criterion).
 import glob as _glob
 import os
 import shutil
+import subprocess
 
 from ._util import log as _log
 
@@ -86,6 +87,49 @@ def _collect_files(paths, results_dir, label, stream):
             _log(stream, "%s: %r not found, skipping (never fails)" % (label, path))
 
 
+def _collect_tree(src_dir, dest_dir, label, stream):
+    """Recursively copy every file under ``src_dir`` into ``dest_dir``.
+
+    Used by the build-deb ``publish:`` stub to collect the produced ``.deb``
+    files (and any other staged outputs) into ``dev/build-out/<artifact>/``,
+    preserving the staging directory's relative layout. Never fails.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    copied = 0
+    for root, _dirs, files in os.walk(src_dir):
+        for name in files:
+            src = os.path.join(root, name)
+            rel = os.path.relpath(src, src_dir)
+            dest = os.path.join(dest_dir, rel)
+            os.makedirs(os.path.dirname(dest) or dest_dir, exist_ok=True)
+            shutil.copy2(src, dest)
+            copied += 1
+            _log(stream, "%s: collected %s -> %s" % (label, src, dest))
+    if copied == 0:
+        _log(stream, "%s: no files under %s, skipping (never fails)"
+                     % (label, src_dir))
+
+
+def _handle_publish(step, results_dir, stream):
+    """Run a ``publish:`` stub: collect the referenced path locally (never ADO).
+
+    A *file* body (e.g. ``publish: .../coverage.xml``) is copied into
+    ``results_dir`` (``dev/build-out/results/``), exactly as in Epic 2. A
+    *directory* body (the build-deb ``publish: $(Build.ArtifactStagingDirectory)/``
+    shorthand for artifact upload) is collected into
+    ``dev/build-out/<artifact>/`` so the produced ``.deb`` files land under
+    ``dev/build-out/`` (E4-T1).
+    """
+    source = step.body
+    if source and os.path.isdir(source):
+        build_out = os.path.dirname(os.path.normpath(results_dir))
+        artifact = step.artifact or "artifact"
+        dest_dir = os.path.join(build_out, artifact)
+        _collect_tree(source, dest_dir, "publish (%s)" % artifact, stream)
+    else:
+        _collect_files([source], results_dir, "publish", stream)
+
+
 def handle_stub_step(step, results_dir, stream):
     """Run a publish/result-publishing stub: copy files into ``results_dir``.
 
@@ -94,7 +138,7 @@ def handle_stub_step(step, results_dir, stream):
     out in a later epic and is only logged here. Never contacts ADO.
     """
     if step.kind == "publish":
-        _collect_files([step.body], results_dir, "publish", stream)
+        _handle_publish(step, results_dir, stream)
         return
 
     task = step.task
@@ -190,4 +234,82 @@ def download_artifact(step, config, default_path, stream, allow_missing=False):
     if copied == 0:
         _log(stream, "DownloadPipelineArtifact@2 (%s): no files matched %r in %s"
                      % (artifact, patterns or "<all>", cache_dir))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# E4-T3: optional, gated ``fetch-artifacts`` helper
+# ---------------------------------------------------------------------------
+# These are the three ADO-only DownloadPipelineArtifact@2 artifacts (no public
+# download URL); the cache keys in dev/sandbox.yaml match their ADO names.
+_FETCH_ENV_CRED_VARS = ("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
+
+
+def _az_available():
+    return bool(shutil.which("az"))
+
+
+def _az_creds_present(environ):
+    return any(environ.get(name) for name in _FETCH_ENV_CRED_VARS)
+
+
+def _fetch_instructions(caches, run_id):
+    lines = [
+        "fetch-artifacts: the Azure CLI (`az`) with a logged-in / PAT credential "
+        "is required to download the ADO-only artifacts automatically.",
+        "  Install it (https://aka.ms/azure-cli) and the devops extension "
+        "(`az extension add --name azure-devops`), export a PAT as "
+        "AZURE_DEVOPS_EXT_PAT, then re-run with --run-id <RUN_ID>.",
+        "  Or download each artifact manually:",
+    ]
+    for artifact, dest in caches.items():
+        lines.append(
+            "    az pipelines runs artifact download --artifact-name %s "
+            "--path %s --run-id %s" % (artifact, dest, run_id or "<RUN_ID>"))
+    lines.append(
+        "  Or build them from source and copy the files into the cache dirs "
+        "(see dev/README.md).")
+    return "\n".join(lines)
+
+
+def _default_az_runner(cmd):
+    subprocess.run(cmd, check=True)
+
+
+def fetch_artifacts(config, stream, run_id=None, az_runner=None, environ=None):
+    """Optionally download the three ADO-only artifacts into the cache (E4-T3).
+
+    Gated and optional: an explicit ``az_runner`` (used by tests) bypasses the
+    gate, otherwise this only shells out to ``az`` when the CLI is installed
+    *and* an ADO credential is present in the environment. When the gate is not
+    satisfied -- or no ``--run-id`` is given -- it prints precise manual
+    acquisition instructions and returns ``False`` without touching the network.
+
+    Returns ``True`` when artifacts were downloaded, ``False`` otherwise.
+    """
+    environ = os.environ if environ is None else environ
+    caches = config.get("artifact_cache") or {}
+    if not caches:
+        _log(stream, "fetch-artifacts: no artifact_cache configured in "
+                     "dev/sandbox.yaml; nothing to do")
+        return False
+
+    if az_runner is None and not (_az_available() and _az_creds_present(environ)):
+        _log(stream, _fetch_instructions(caches, run_id))
+        return False
+
+    if run_id is None:
+        _log(stream, "fetch-artifacts: --run-id <RUN_ID> is required to download "
+                     "via az.\n" + _fetch_instructions(caches, run_id))
+        return False
+
+    runner = az_runner or _default_az_runner
+    for artifact, dest in caches.items():
+        os.makedirs(dest, exist_ok=True)
+        cmd = ["az", "pipelines", "runs", "artifact", "download",
+               "--artifact-name", artifact, "--path", dest,
+               "--run-id", str(run_id)]
+        _log(stream, "fetch-artifacts: %s" % " ".join(cmd))
+        runner(cmd)
+        _log(stream, "fetch-artifacts: %s -> %s" % (artifact, dest))
     return True

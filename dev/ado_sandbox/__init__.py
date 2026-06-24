@@ -147,6 +147,8 @@ def main(argv=None):
                         help="turn DownloadPipelineArtifact stubs into warnings")
     parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
                         help="override a runtime variable (highest precedence)")
+    parser.add_argument("--run-id", default=None, metavar="RUN_ID",
+                        help="ADO run id for `fetch-artifacts` (optional helper)")
     parser.add_argument("--config", default=None, metavar="PATH",
                         help="path to sandbox.yaml (default: dev/sandbox.yaml)")
     parser.add_argument("--pipeline", default=None, help="path to azure-pipelines.yml")
@@ -159,6 +161,10 @@ def main(argv=None):
     if args.list:
         _print_list(pipeline_path, sys.stdout)
         return 0
+    if args.job == "fetch-artifacts":
+        from . import tasks
+        ok = tasks.fetch_artifacts(config, sys.stdout, run_id=args.run_id)
+        return 0 if ok else 1
     if args.dry_run:
         if not args.job:
             parser.error("--dry-run requires a job argument")

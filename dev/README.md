@@ -28,11 +28,15 @@ dev/ado-sandbox go_static_checks --no-container
 dev/ado-sandbox integration_tests
 dev/ado-sandbox memleak_tests
 
+# Build the amd64 .deb packages (mgmt-common + sonic-gnmi) in the container.
+dev/ado-sandbox amd64
+
 # Drop into an interactive shell in the prepared container.
 dev/ado-sandbox --shell integration_tests
 ```
 
-Collected results (junit / coverage) land in `dev/build-out/results/`.
+Collected results (junit / coverage) land in `dev/build-out/results/`; the
+`amd64` job's `.deb` packages land in `dev/build-out/sonic-gnmi/`.
 
 ## Tiers
 
@@ -103,6 +107,16 @@ az pipelines runs artifact download \
   --run-id <RUN_ID>
 ```
 
+Or let the optional, gated `fetch-artifacts` helper download all three at once.
+It only shells out to `az` when the CLI is installed **and** an ADO credential
+is present (`AZURE_DEVOPS_EXT_PAT` or `SYSTEM_ACCESSTOKEN`); otherwise it prints
+manual acquisition instructions and exits without touching the network:
+
+```bash
+export AZURE_DEVOPS_EXT_PAT=<your-pat>
+dev/ado-sandbox fetch-artifacts --run-id <RUN_ID>
+```
+
 Otherwise build them from source (sonic-buildimage / sonic-swss-common) and copy
 the resulting files into the cache directory, preserving the artifact's internal
 layout (e.g. `target/debs/trixie/...`, `target/python-wheels/trixie/...`).
@@ -125,6 +139,42 @@ dev/ado-sandbox integration_tests
 ADO_SANDBOX_E2E_CONTAINER=1 \
   python3 -m pytest dev/tests/test_resolver.py -k container_end_to_end
 ```
+
+## Building the `amd64` .deb packages
+
+The `amd64` job reproduces `.azure/templates/build-deb.yml` inside the slave
+container: it checks out `self` + `sonic-mgmt-common` + `sonic-swss-common`,
+installs the build dependencies (`arch=amd64`, `installTestDeps=false`), builds
+`sonic-mgmt-common` then `sonic-gnmi` via `dpkg-buildpackage -j$(nproc)`, and
+collects the produced `.deb` files:
+
+```bash
+# Inspect the resolved step list (checkouts, deps, build, publish) — no Docker.
+dev/ado-sandbox amd64 --dry-run
+
+# Build the packages (needs the slave image + populated artifact cache).
+dev/ado-sandbox amd64
+```
+
+The `publish:` step is stubbed: instead of uploading to ADO it copies the
+staged outputs into `dev/build-out/sonic-gnmi/`, so a successful run leaves a
+`sonic-gnmi_*.deb` (and the mgmt-common / swss-common debs) under
+`dev/build-out/`.
+
+## Reproducing all four target step-groups from scratch
+
+| Step-group                        | Command                              | Tier      |
+|-----------------------------------|--------------------------------------|-----------|
+| `pure_tests`                      | `dev/ado-sandbox pure_tests --no-container`       | bare-host |
+| `go_static_checks`                | `dev/ado-sandbox go_static_checks --no-container` | bare-host |
+| `integration_tests` / `memleak_tests` | `dev/ado-sandbox integration_tests`          | container |
+| `amd64`                           | `dev/ado-sandbox amd64`              | container |
+
+A new developer reproduces the container tiers by (1) building/tagging
+`sonic-slave-trixie:local` from `sonic-buildimage` (see *The slave image*
+above), (2) populating the artifact cache — from source or via
+`dev/ado-sandbox fetch-artifacts --run-id <RUN_ID>` (see *The artifact cache*
+above), then (3) running each command in the table.
 
 ## Tests
 

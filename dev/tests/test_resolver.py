@@ -795,5 +795,187 @@ def test_integration_tests_container_end_to_end():
     assert os.path.isdir(results)
 
 
+# ==========================================================================
+# Epic 4 -- build-deb + Docs + Hardening
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# E4-T1: the build-deb `publish:` directory stub collects .deb into build-out
+# --------------------------------------------------------------------------
+def test_publish_directory_collects_debs_into_build_out(tmp_path):
+    build_out = tmp_path / "build-out"
+    staging = build_out / "staging"
+    staging.mkdir(parents=True)
+    (staging / "sonic-gnmi_1.0.0_amd64.deb").write_text("deb")
+    (staging / "sonic-gnmi-dbg_1.0.0_amd64.deb").write_text("dbg")
+    results = build_out / "results"
+    step = _step("publish", body=str(staging), artifact="sonic-gnmi")
+    tasks.handle_stub_step(step, str(results), io.StringIO())
+
+    debs = sorted(p.name for p in (build_out / "sonic-gnmi").glob("*.deb"))
+    assert debs == ["sonic-gnmi-dbg_1.0.0_amd64.deb", "sonic-gnmi_1.0.0_amd64.deb"]
+
+
+def test_publish_directory_preserves_relative_layout(tmp_path):
+    build_out = tmp_path / "build-out"
+    staging = build_out / "staging"
+    nested = staging / "debs"
+    nested.mkdir(parents=True)
+    (nested / "libfoo_1_amd64.deb").write_text("x")
+    results = build_out / "results"
+    step = _step("publish", body=str(staging), artifact="sonic-gnmi")
+    tasks.handle_stub_step(step, str(results), io.StringIO())
+    assert (build_out / "sonic-gnmi" / "debs" / "libfoo_1_amd64.deb").exists()
+
+
+def test_publish_file_still_copies_to_results(tmp_path):
+    # File `publish:` (coverage) keeps the Epic 2 behaviour: copy to results_dir.
+    src = tmp_path / "coverage.xml"
+    src.write_text("<c/>")
+    results = tmp_path / "build-out" / "results"
+    step = _step("publish", body=str(src), artifact="coverage-pure")
+    tasks.handle_stub_step(step, str(results), io.StringIO())
+    assert (results / "coverage.xml").read_text() == "<c/>"
+
+
+# --------------------------------------------------------------------------
+# E4-T1/T4: amd64 build-deb job resolves to the expected container steps
+# --------------------------------------------------------------------------
+def test_amd64_dry_run_emits_build_deb_steps(capsys):
+    config = {"image": "sonic-slave-trixie:local", "artifact_cache": {}, "vars": {}}
+    rc = executor.run_job(PIPELINE, "amd64", config=config, dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "docker run --rm" in out
+    assert "sonic-slave-trixie:local" in out
+    # mgmt-common is built first, then sonic-gnmi via dpkg-buildpackage -j$(nproc).
+    assert "pushd sonic-mgmt-common" in out
+    assert "dpkg-buildpackage -rfakeroot -us -uc -b -j$(nproc)" in out
+
+
+def test_amd64_plan_publishes_deb_artifact():
+    config = {"image": "sonic-slave-trixie:local", "artifact_cache": {}, "vars": {}}
+    plan = executor.prepare_container_job(PIPELINE, "amd64", config,
+                                          stream=io.StringIO())
+    publishes = [s for s in plan.publish_steps if s.kind == "publish"]
+    assert any(s.artifact == "sonic-gnmi" for s in publishes)
+    # The build-deb publish targets the staging directory under dev/build-out.
+    deb_publish = [s for s in publishes if s.artifact == "sonic-gnmi"][0]
+    assert deb_publish.body.rstrip("/") == plan.staging_dir.rstrip("/")
+
+
+# --------------------------------------------------------------------------
+# E4-T4: smoke coverage across all four target step-groups
+# --------------------------------------------------------------------------
+TARGET_JOBS = ["pure_tests", "go_static_checks", "integration_tests",
+               "memleak_tests", "amd64"]
+
+
+@pytest.mark.parametrize("job", TARGET_JOBS)
+def test_target_job_resolves_to_steps(job):
+    steps, condition = resolver.resolve_job(PIPELINE, job)
+    assert steps
+    assert condition is True
+
+
+def test_bare_host_jobs_dry_run_assemble_script(capsys):
+    for job in ["pure_tests", "go_static_checks"]:
+        rc = executor.run_job(PIPELINE, job, no_container=True, dry_run=True)
+        assert rc == 0
+    out = capsys.readouterr().out
+    assert "set -e" in out
+
+
+def test_container_jobs_dry_run_emit_docker(capsys):
+    config = {"image": "sonic-slave-trixie:local", "artifact_cache": {}, "vars": {}}
+    for job in ["integration_tests", "memleak_tests", "amd64"]:
+        rc = executor.run_job(PIPELINE, job, config=config, dry_run=True)
+        assert rc == 0
+    out = capsys.readouterr().out
+    assert out.count("docker run --rm") == 3
+
+
+# --------------------------------------------------------------------------
+# E4-T4 (golden): canonical YAML is byte-identical before/after any run
+# --------------------------------------------------------------------------
+def test_canonical_yaml_byte_identical_across_all_jobs(tmp_path):
+    def _sha(path):
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+
+    def digest():
+        return {path: _sha(path) for path in CANONICAL_FILES}
+
+    config = {"image": "sonic-slave-trixie:local", "artifact_cache": {}, "vars": {}}
+    before = digest()
+    # Exercise the full resolution + dry-run path for every target job.
+    for job in ["pure_tests", "go_static_checks"]:
+        executor.run_job(PIPELINE, job, no_container=True, dry_run=True,
+                         stream=io.StringIO())
+    for job in ["integration_tests", "memleak_tests", "amd64"]:
+        executor.run_job(PIPELINE, job, config=config, dry_run=True,
+                         stream=io.StringIO())
+        executor.prepare_container_job(PIPELINE, job, config, stream=io.StringIO())
+    after = digest()
+    assert before == after
+
+
+# --------------------------------------------------------------------------
+# E4-T3: optional, gated fetch-artifacts helper (uses `az` if creds present)
+# --------------------------------------------------------------------------
+def test_fetch_artifacts_no_cache_configured_is_noop():
+    log = io.StringIO()
+    ok = tasks.fetch_artifacts({"artifact_cache": {}}, log, run_id="42")
+    assert ok is False
+    assert "no artifact_cache" in log.getvalue()
+
+
+def test_fetch_artifacts_gated_prints_instructions_without_az(tmp_path):
+    log = io.StringIO()
+    config = {"artifact_cache": {"common-lib": str(tmp_path / "c")}}
+    # No az_runner and an empty environ -> the helper must not raise and must
+    # print manual acquisition instructions instead of touching the network.
+    ok = tasks.fetch_artifacts(config, log, run_id="42", environ={})
+    assert ok is False
+    out = log.getvalue()
+    assert "az pipelines runs artifact download" in out
+
+
+def test_fetch_artifacts_requires_run_id():
+    log = io.StringIO()
+    calls = []
+    config = {"artifact_cache": {"common-lib": "/tmp/c"}}
+    ok = tasks.fetch_artifacts(config, log, run_id=None,
+                               az_runner=lambda cmd: calls.append(cmd))
+    assert ok is False
+    assert not calls
+    assert "--run-id" in log.getvalue()
+
+
+def test_fetch_artifacts_downloads_each_artifact_via_runner(tmp_path):
+    log = io.StringIO()
+    calls = []
+    caches = {
+        "common-lib": str(tmp_path / "common-lib"),
+        "sonic-buildimage.vs": str(tmp_path / "vs"),
+        "sonic-swss-common-trixie": str(tmp_path / "swss"),
+    }
+    config = {"artifact_cache": caches}
+    ok = tasks.fetch_artifacts(config, log, run_id="123",
+                               az_runner=lambda cmd: calls.append(cmd))
+    assert ok is True
+    # One az invocation per configured artifact, each targeting its cache dir.
+    assert len(calls) == 3
+    for artifact, dest in caches.items():
+        assert os.path.isdir(dest)
+        match = [c for c in calls if "--artifact-name" in c
+                 and c[c.index("--artifact-name") + 1] == artifact]
+        assert match, artifact
+        cmd = match[0]
+        assert cmd[:5] == ["az", "pipelines", "runs", "artifact", "download"]
+        assert cmd[cmd.index("--path") + 1] == dest
+        assert cmd[cmd.index("--run-id") + 1] == "123"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

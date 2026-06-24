@@ -399,19 +399,20 @@ The hard ADO parts and how C handles them:
 ### Epic 4 — build-deb + Docs + Hardening
 **Goal:** Reproduce packaging and document the workflow.
 **Prerequisites:** Epic 3.
+**Status:** DONE
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E4-T1 | IMPL | `amd64` job via `build-deb.yml`: build mgmt-common + sonic-gnmi `.deb`, collect to `dev/build-out/` | `dev/ado_sandbox/executor.py`, `dev/ado_sandbox/tasks.py` | TO DO |
-| E4-T2 | DOC | `dev/README.md`: obtain slave image (sonic-buildimage build-from-source), populate artifact cache, run each job | `dev/README.md` | TO DO |
-| E4-T3 | IMPL | Optional `fetch-artifacts` helper (uses `az` if creds present) — gated, optional | `dev/ado_sandbox/tasks.py` | TO DO |
-| E4-T4 | TEST | Golden + smoke tests across all four target jobs; assert zero writes to canonical YAML | `dev/tests/test_resolver.py` | TO DO |
+| E4-T1 | IMPL | `amd64` job via `build-deb.yml`: build mgmt-common + sonic-gnmi `.deb`, collect to `dev/build-out/` | `dev/ado_sandbox/executor.py`, `dev/ado_sandbox/tasks.py` | DONE |
+| E4-T2 | DOC | `dev/README.md`: obtain slave image (sonic-buildimage build-from-source), populate artifact cache, run each job | `dev/README.md` | DONE |
+| E4-T3 | IMPL | Optional `fetch-artifacts` helper (uses `az` if creds present) — gated, optional | `dev/ado_sandbox/tasks.py` | DONE |
+| E4-T4 | TEST | Golden + smoke tests across all four target jobs; assert zero writes to canonical YAML | `dev/tests/test_resolver.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `dev/ado-sandbox amd64` produces a `sonic-gnmi*.deb` under `dev/build-out/`.
-- [ ] `dev/README.md` lets a new developer reproduce all four target step-groups from scratch.
-- [ ] Test suite proves the canonical `.azure/` + root YAML are byte-identical before/after any run.
-- [ ] Committed footprint stays within `dev/`; no production files changed.
+- [x] `dev/ado-sandbox amd64` produces a `sonic-gnmi*.deb` under `dev/build-out/`.
+- [x] `dev/README.md` lets a new developer reproduce all four target step-groups from scratch.
+- [x] Test suite proves the canonical `.azure/` + root YAML are byte-identical before/after any run.
+- [x] Committed footprint stays within `dev/`; no production files changed.
 
 ---
 
