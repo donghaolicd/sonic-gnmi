@@ -363,19 +363,20 @@ The hard ADO parts and how C handles them:
 ### Epic 2 — Executor + Bare-Host Tiers
 **Goal:** Actually run the dependency-free jobs locally.
 **Prerequisites:** Epic 1.
+**Status:** DONE
 
 | Task ID | Type | Description | Files | Status |
 |---------|------|-------------|-------|--------|
-| E2-T1 | IMPL | Bash assembler: concat step bodies with `set -e`, per-step `workingDirectory`/`env`/section markers | `dev/ado_sandbox/executor.py` | TO DO |
-| E2-T2 | IMPL | `--no-container` bare-host run; `install-go.yml` honored | `dev/ado_sandbox/executor.py` | TO DO |
-| E2-T3 | IMPL | `checkout` handler → map to local sibling dirs / repo root | `dev/ado_sandbox/tasks.py` | TO DO |
-| E2-T4 | IMPL | `publish`/`PublishTestResults@2`/`PublishCodeCoverageResults@2` stubs → copy to `dev/build-out/results/` | `dev/ado_sandbox/tasks.py` | TO DO |
-| E2-T5 | TEST | Run `pure_tests` and `go_static_checks` end-to-end; assert exit codes + result files | `dev/tests/test_resolver.py` | TO DO |
+| E2-T1 | IMPL | Bash assembler: concat step bodies with `set -e`, per-step `workingDirectory`/`env`/section markers | `dev/ado_sandbox/executor.py` | DONE |
+| E2-T2 | IMPL | `--no-container` bare-host run; `install-go.yml` honored | `dev/ado_sandbox/executor.py` | DONE |
+| E2-T3 | IMPL | `checkout` handler → map to local sibling dirs / repo root | `dev/ado_sandbox/tasks.py` | DONE |
+| E2-T4 | IMPL | `publish`/`PublishTestResults@2`/`PublishCodeCoverageResults@2` stubs → copy to `dev/build-out/results/` | `dev/ado_sandbox/tasks.py` | DONE |
+| E2-T5 | TEST | Run `pure_tests` and `go_static_checks` end-to-end; assert exit codes + result files | `dev/tests/test_resolver.py` | DONE |
 
 **Acceptance Criteria:**
-- [ ] `dev/ado-sandbox pure_tests --no-container` runs `make -f pure.mk junit-xml` and produces `junit-pure.xml` collected into `dev/build-out/results/`.
-- [ ] `dev/ado-sandbox go_static_checks --no-container` reproduces the `gofmt` gate (passes clean tree, fails on an unformatted file).
-- [ ] Publish/checkout stubs never attempt network/ADO calls.
+- [x] `dev/ado-sandbox pure_tests --no-container` runs `make -f pure.mk junit-xml` and produces `junit-pure.xml` collected into `dev/build-out/results/`.
+- [x] `dev/ado-sandbox go_static_checks --no-container` reproduces the `gofmt` gate (passes clean tree, fails on an unformatted file).
+- [x] Publish/checkout stubs never attempt network/ADO calls.
 
 ### Epic 3 — Container + setup-test-env + Artifact Stubs
 **Goal:** Reproduce the SONiC-dependent test jobs in the slave container.

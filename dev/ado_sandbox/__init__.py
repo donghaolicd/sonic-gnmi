@@ -8,6 +8,7 @@ import argparse
 import os
 import sys
 
+from . import executor
 from .loader import load_yaml
 from .resolver import list_jobs, resolve_job
 
@@ -80,6 +81,8 @@ def main(argv=None):
     parser.add_argument("job", nargs="?", help="job key to resolve (e.g. pure_tests)")
     parser.add_argument("--list", action="store_true", help="list stages/jobs in the YAML")
     parser.add_argument("--dry-run", action="store_true", help="resolve + print steps (no Docker)")
+    parser.add_argument("--no-container", action="store_true",
+                        help="run the job bare-host (pure_tests, go_static_checks)")
     parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
                         help="override a runtime variable (highest precedence)")
     parser.add_argument("--pipeline", default=None, help="path to azure-pipelines.yml")
@@ -91,6 +94,11 @@ def main(argv=None):
     if args.list:
         _print_list(pipeline_path, sys.stdout)
         return 0
+    if args.no_container:
+        if not args.job:
+            parser.error("--no-container requires a job argument")
+        return executor.run_job(pipeline_path, args.job, cli_vars,
+                                no_container=True, dry_run=args.dry_run)
     if args.dry_run:
         if not args.job:
             parser.error("--dry-run requires a job argument")
