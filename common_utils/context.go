@@ -70,6 +70,7 @@ const (
 	DBUS_IMAGE_ACTIVATE
 	DBUS_DOCKER_LOAD
 	DBUS_CONFIG_REPLACE
+	GNMI_AUDIT_LOST
 	COUNTER_SIZE
 )
 
@@ -85,6 +86,8 @@ func (c CounterType) String() string {
 		return "GNMI set fail"
 	case GNMI_SET_BYPASS:
 		return "GNMI set bypass"
+	case GNMI_AUDIT_LOST:
+		return "GNMI audit lost"
 	case GNOI_REBOOT:
 		return "GNOI reboot"
 	case GNOI_FACTORY_RESET:
