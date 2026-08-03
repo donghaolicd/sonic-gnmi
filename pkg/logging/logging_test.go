@@ -15,6 +15,14 @@ import (
 	"github.com/sonic-net/sonic-gnmi/pkg/logging"
 )
 
+type testAddr struct {
+	network string
+	address string
+}
+
+func (a testAddr) Network() string { return a.network }
+func (a testAddr) String() string  { return a.address }
+
 // TestGRPCCode covers TEST-017(a): nil error, status error, and context errors.
 func TestGRPCCode(t *testing.T) {
 	tests := []struct {
@@ -37,10 +45,11 @@ func TestGRPCCode(t *testing.T) {
 	}
 }
 
-// TestPeerTypeAddr covers TEST-017(b): TCP, unix, and missing peer.
+// TestPeerTypeAddr covers TEST-017(b): TCP, unix, unknown, and missing peers.
 func TestPeerTypeAddr(t *testing.T) {
 	tcpAddr := &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1234}
 	unixAddr := &net.UnixAddr{Name: "/var/run/gnmi.sock", Net: "unix"}
+	unknownAddr := testAddr{network: "quic", address: "10.0.0.99:9999"}
 
 	tests := []struct {
 		name         string
@@ -59,6 +68,12 @@ func TestPeerTypeAddr(t *testing.T) {
 			ctx:          peer.NewContext(context.Background(), &peer.Peer{Addr: unixAddr}),
 			wantPeerType: "unix",
 			wantPeerAddr: unixAddr.String(),
+		},
+		{
+			name:         "unknown network peer",
+			ctx:          peer.NewContext(context.Background(), &peer.Peer{Addr: unknownAddr}),
+			wantPeerType: "unknown",
+			wantPeerAddr: unknownAddr.String(),
 		},
 		{
 			name:         "no peer",

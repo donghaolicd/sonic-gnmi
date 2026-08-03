@@ -45,7 +45,8 @@ func GRPCCode(err error) codes.Code {
 
 // PeerTypeAddr extracts the peer type and address from ctx. The peer type is
 // one of "tcp", "unix", or "unknown". The address is the Addr.String() value
-// for known types, or empty for "unknown".
+// whenever a non-nil peer address exists, including unknown network types.
+// It is empty only when the context has no peer address.
 func PeerTypeAddr(ctx context.Context) (peerType, peerAddress string) {
 	p, ok := peer.FromContext(ctx)
 	if !ok || p.Addr == nil {
