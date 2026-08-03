@@ -1333,6 +1333,25 @@ func TestTrySet(t *testing.T) {
 	// Set up allowed SKU
 	mr.HSet("DEVICE_METADATA|localhost", "hwsku", "Cisco-8102-test")
 
+	t.Run("aggregate bypass eligibility has no write effect", func(t *testing.T) {
+		ctx := metadata.NewIncomingContext(
+			context.Background(),
+			metadata.Pairs(MetadataKeyBypassValidation, "true"),
+		)
+		updates := []*gnmipb.Update{{
+			Path: &gnmipb.Path{Elem: []*gnmipb.PathElem{{Name: "VNET"}, {Name: "vnet-eligibility"}}},
+			Val: &gnmipb.TypedValue{
+				Value: &gnmipb.TypedValue_JsonIetfVal{JsonIetfVal: []byte(`{"vni":"1000"}`)},
+			},
+		}}
+		if !ShouldBypassSet(ctx, nil, nil, updates) {
+			t.Fatal("ShouldBypassSet() = false, want true")
+		}
+		if mr.Exists("VNET|vnet-eligibility") {
+			t.Fatal("ShouldBypassSet() wrote to CONFIG_DB")
+		}
+	})
+
 	t.Run("bypass conditions not met - no header", func(t *testing.T) {
 		ctx := context.Background()
 		updates := []*gnmipb.Update{

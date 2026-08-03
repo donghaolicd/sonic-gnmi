@@ -1090,37 +1090,22 @@ func SaveOnSetEnabled() error {
 // SaveOnSetDisabeld does nothing.
 func saveOnSetDisabled() error { return nil }
 
-func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetResponse, error) {
+func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (resp *gnmipb.SetResponse, retErr error) {
+	rc, ctx := common_utils.GetContext(ctx)
+	audit := defaultGNMIAuditLogger.newSetRecord(ctx, rc.ID, req, defaultGNMIAuditLogger.now())
+	defer defaultGNMIAuditLogger.finishSet(audit, &retErr)
+
 	e := s.ReqFromMaster(req, &s.masterEID)
 	if e != nil {
+		audit.Reason = reasonNotMaster
 		return nil, e
 	}
 
 	common_utils.IncCounter(common_utils.GNMI_SET)
 	if s.config.EnableTranslibWrite == false && s.config.EnableNativeWrite == false {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+		audit.Reason = reasonReadOnly
 		return nil, grpc.Errorf(codes.Unimplemented, "GNMI is in read-only mode")
-	}
-	// gNMI path based authorization
-	if s.config.PathzPolicy {
-		user, err := getUsername(ctx)
-		if err != nil {
-			log.V(1).Infof("SetRequest User not found: %s", err.Error())
-			return nil, err
-		}
-		permitted := true
-		for _, path := range req.GetDelete() {
-			s.gnsiPathz.pathzProcessor.AuthorizeWithPrefix(user, req.GetPrefix(), path, gnsi_pathz_pb.Mode_MODE_WRITE)
-		}
-		for _, update := range req.GetReplace() {
-			s.gnsiPathz.pathzProcessor.AuthorizeWithPrefix(user, req.GetPrefix(), update.GetPath(), gnsi_pathz_pb.Mode_MODE_WRITE)
-		}
-		for _, update := range req.GetUpdate() {
-			s.gnsiPathz.pathzProcessor.AuthorizeWithPrefix(user, req.GetPrefix(), update.GetPath(), gnsi_pathz_pb.Mode_MODE_WRITE)
-		}
-		if !permitted {
-			return nil, status.Error(codes.PermissionDenied, "Unauthorized request. Rejected by pathz policy.")
-		}
 	}
 	var results []*gnmipb.UpdateResult
 
@@ -1145,50 +1130,102 @@ func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetRe
 	if origin == "" {
 		origin, err = ParseOrigin(paths)
 		if err != nil {
+			audit.Reason = reasonInvalidOrigin
 			return nil, err
 		}
 	}
 	authTarget := "gnmi"
+	bypassCandidate := false
+	allUpdates := make([]*gnmipb.Update, 0, len(req.GetReplace())+len(req.GetUpdate()))
+	allUpdates = append(allUpdates, req.GetReplace()...)
+	allUpdates = append(allUpdates, req.GetUpdate()...)
 	if check := IsNativeOrigin(origin); check {
 		if s.config.EnableNativeWrite == false {
 			common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+			audit.Reason = reasonNativeDisabled
 			return nil, grpc.Errorf(codes.Unimplemented, "GNMI native write is disabled")
 		}
 
-		// Fast path: bypass validation for allowed tables/SKUs
-		allUpdates := append(req.GetReplace(), req.GetUpdate()...)
-		if resp, used, err := bypass.TrySet(ctx, prefix, req.GetDelete(), allUpdates); used {
-			if err != nil {
-				common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			common_utils.IncCounter(common_utils.GNMI_SET_BYPASS)
-			return resp, nil
+		bypassCandidate = bypass.ShouldBypassSet(ctx, prefix, req.GetDelete(), allUpdates)
+		if bypassCandidate {
+			audit.Set.Backend = backendBypass
+			authTarget = "gnmi_config_db"
+		} else {
+			audit.Set.Backend = backendNative
+			var targetDbName string
+			dc, err = sdc.NewMixedDbClient(paths, prefix, origin, encoding, s.config.ZmqPort, s.config.Vrf, &targetDbName)
+			authTarget = "gnmi_" + targetDbName
 		}
-
-		var targetDbName string
-		dc, err = sdc.NewMixedDbClient(paths, prefix, origin, encoding, s.config.ZmqPort, s.config.Vrf, &targetDbName)
-		authTarget = "gnmi_" + targetDbName
 	} else {
 		if s.config.EnableTranslibWrite == false {
 			common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+			audit.Reason = reasonTranslibDisabled
 			return nil, grpc.Errorf(codes.Unimplemented, "Translib write is disabled")
 		}
+		audit.Set.Backend = backendTranslib
 		/* Create Transl client. */
 		dc, err = sdc.NewTranslClient(prefix, nil, ctx, extensions)
 	}
 
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+		audit.Reason = reasonClientCreateFailed
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
-	defer dc.Close()
+	if dc != nil {
+		defer dc.Close()
+	}
 
 	ctx, err = authenticate(s.config, ctx, authTarget, true)
+	audit.stageAccess(rc.Auth.AuthEnabled, rc.Auth.User, transportValidatedPrincipal(ctx), audit.PeerType, err)
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+		audit.Reason = reasonAccessDenied
 		return nil, err
 	}
+	if rc.Auth.AuthEnabled && rc.Auth.User == "" {
+		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+		err = status.Error(codes.Unauthenticated, "Authenticated user is unavailable")
+		audit.stageAccess(rc.Auth.AuthEnabled, rc.Auth.User, transportValidatedPrincipal(ctx), audit.PeerType, err)
+		audit.Reason = reasonAccessDenied
+		return nil, err
+	}
+
+	if s.config.PathzPolicy {
+		audit.PathAuthzResult, err = authorizeSetRequest(s.gnsiPathz.pathzProcessor, rc.Auth.User, req)
+		if err != nil {
+			common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+			if audit.PathAuthzResult == setPathError {
+				audit.Reason = reasonPathPolicyError
+			} else {
+				audit.Reason = reasonPathPolicyDenied
+			}
+			return nil, err
+		}
+	} else {
+		audit.PathAuthzResult = setPathNotEnabled
+	}
+
+	if bypassCandidate {
+		resp, used, bypassErr := bypass.TrySet(ctx, prefix, req.GetDelete(), allUpdates)
+		if !used {
+			common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+			audit.Set.ExecutionResult = executionFailed
+			audit.Reason = reasonBackendFailed
+			return nil, status.Error(codes.Internal, "Bypass eligibility changed before execution")
+		}
+		if bypassErr != nil {
+			common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+			audit.Set.ExecutionResult = executionFailed
+			audit.Reason = reasonBackendFailed
+			return nil, status.Error(codes.Internal, "Bypass operation failed")
+		}
+		common_utils.IncCounter(common_utils.GNMI_SET_BYPASS)
+		audit.Set.ExecutionResult = executionSucceeded
+		audit.Reason = reasonCompleted
+		return resp, nil
+	}
+
 	/* DELETE */
 	for _, path := range req.GetDelete() {
 		log.V(2).Infof("Delete path: %v", path)
@@ -1228,7 +1265,11 @@ func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetRe
 	err = dc.Set(req.GetDelete(), req.GetReplace(), req.GetUpdate())
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+		audit.Set.ExecutionResult = executionFailed
+		audit.Reason = reasonBackendFailed
 	} else {
+		audit.Set.ExecutionResult = executionSucceeded
+		audit.Reason = reasonCompleted
 		s.SaveStartupConfig()
 	}
 

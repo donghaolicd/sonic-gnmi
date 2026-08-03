@@ -279,6 +279,7 @@ func PopulateAuthStructByCommonName(certCommonName string, auth *common_utils.Au
 	if len(auth.Roles) == 0 {
 		return status.Errorf(codes.Unauthenticated, "Invalid cert cname:'%s', not a trusted cert common name.", certCommonName)
 	} else {
+		auth.User = certCommonName
 		return nil
 	}
 }

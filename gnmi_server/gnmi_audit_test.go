@@ -471,6 +471,75 @@ func TestGNMIAuditFiniteTokens(t *testing.T) {
 	}
 }
 
+func TestGNMIAuditStageAccess(t *testing.T) {
+	tests := []struct {
+		name          string
+		authEnabled   bool
+		username      string
+		transportUser string
+		peerType      string
+		authErr       error
+		wantIdentity  identityState
+		wantPrincipal string
+		wantAccess    accessResult
+	}{
+		{
+			name:          "validated",
+			authEnabled:   true,
+			username:      "admin",
+			peerType:      "tcp",
+			wantIdentity:  identityValidated,
+			wantPrincipal: "admin",
+			wantAccess:    accessAllowed,
+		},
+		{
+			name:          "authorized identity denied",
+			authEnabled:   true,
+			username:      "admin",
+			peerType:      "tcp",
+			authErr:       status.Error(codes.PermissionDenied, "role denied"),
+			transportUser: "admin",
+			wantIdentity:  identityTransportValidated,
+			wantPrincipal: "admin",
+			wantAccess:    accessDenied,
+		},
+		{
+			name:         "authentication failed",
+			authEnabled:  true,
+			username:     "caller-controlled",
+			peerType:     "tcp",
+			authErr:      status.Error(codes.Unauthenticated, "failed"),
+			wantIdentity: identityNotValidated,
+			wantAccess:   accessDenied,
+		},
+		{
+			name:         "auth disabled",
+			peerType:     "tcp",
+			wantIdentity: identityAuthDisabled,
+			wantAccess:   accessAuthDisabled,
+		},
+		{
+			name:         "local UDS",
+			peerType:     "unix",
+			wantIdentity: identityLocalUDS,
+			wantAccess:   accessLocalUDS,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			common := &gnmiAuditCommon{}
+			common.stageAccess(tc.authEnabled, tc.username, tc.transportUser, tc.peerType, tc.authErr)
+			if common.IdentityState != tc.wantIdentity ||
+				common.Principal != tc.wantPrincipal ||
+				common.AccessResult != tc.wantAccess {
+				t.Fatalf("stageAccess() = (%q,%q,%q), want (%q,%q,%q)",
+					common.IdentityState, common.Principal, common.AccessResult,
+					tc.wantIdentity, tc.wantPrincipal, tc.wantAccess)
+			}
+		})
+	}
+}
+
 func minimalGetRecord(start time.Time) *gnmiGetAuditRecord {
 	return &gnmiGetAuditRecord{
 		gnmiAuditCommon: gnmiAuditCommon{

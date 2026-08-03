@@ -321,6 +321,37 @@ func (c *gnmiAuditCommon) finalize(finished time.Time, err error) {
 	c.DurationMS = finished.Sub(c.started).Milliseconds()
 }
 
+func (c *gnmiAuditCommon) stageAccess(authEnabled bool, username, transportPrincipal, peerType string, authErr error) {
+	c.Principal = ""
+	if peerType == "unix" {
+		c.IdentityState = identityLocalUDS
+		c.AccessResult = accessLocalUDS
+		return
+	}
+	if !authEnabled {
+		c.IdentityState = identityAuthDisabled
+		c.AccessResult = accessAuthDisabled
+		return
+	}
+	if authErr != nil {
+		if transportPrincipal != "" {
+			c.IdentityState = identityTransportValidated
+			c.Principal = transportPrincipal
+		} else {
+			c.IdentityState = identityNotValidated
+		}
+		c.AccessResult = accessDenied
+		return
+	}
+	if username != "" {
+		c.IdentityState = identityValidated
+		c.Principal = username
+	} else {
+		c.IdentityState = identityNotValidated
+	}
+	c.AccessResult = accessAllowed
+}
+
 func (l *gnmiAuditLogger) emit(record any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

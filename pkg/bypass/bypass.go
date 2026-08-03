@@ -115,6 +115,24 @@ func ShouldBypassDelete(ctx context.Context, prefix *gnmipb.Path, deletes []*gnm
 	return true
 }
 
+// ShouldBypassSet checks whether all Set operations qualify for the bypass
+// path without applying any configuration changes.
+func ShouldBypassSet(ctx context.Context, prefix *gnmipb.Path, deletes []*gnmipb.Path, updates []*gnmipb.Update) bool {
+	if len(updates) == 0 && len(deletes) == 0 {
+		return false
+	}
+	if !hasBypassHeader(ctx) || !checkSKU() {
+		return false
+	}
+	if len(updates) > 0 && !checkAllowedTables(prefix, updates) {
+		return false
+	}
+	if len(deletes) > 0 && !checkAllowedDeletePaths(prefix, deletes) {
+		return false
+	}
+	return true
+}
+
 // checkAllowedDeletePaths verifies all delete paths target allowed tables
 func checkAllowedDeletePaths(prefix *gnmipb.Path, deletes []*gnmipb.Path) bool {
 	for _, path := range deletes {
@@ -389,16 +407,7 @@ func convertToRedisFields(data map[string]interface{}) map[string]interface{} {
 // Returns (nil, true, error) if bypass was attempted but failed.
 // Returns (nil, false, nil) if bypass conditions were not met (caller should use normal path).
 func TrySet(ctx context.Context, prefix *gnmipb.Path, deletes []*gnmipb.Path, updates []*gnmipb.Update) (*gnmipb.SetResponse, bool, error) {
-	// Must have at least one operation
-	if len(updates) == 0 && len(deletes) == 0 {
-		return nil, false, nil
-	}
-
-	// Check bypass conditions for all operations
-	if len(updates) > 0 && !ShouldBypass(ctx, prefix, updates) {
-		return nil, false, nil
-	}
-	if len(deletes) > 0 && !ShouldBypassDelete(ctx, prefix, deletes) {
+	if !ShouldBypassSet(ctx, prefix, deletes, updates) {
 		return nil, false, nil
 	}
 
