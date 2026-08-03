@@ -112,20 +112,8 @@ type Server struct {
 	gnsi_credentialz_pb.UnimplementedCredentialzServer
 }
 
-// handleOperationalGet handles OPERATIONAL target requests directly with standard gNMI types
-func (s *Server) handleOperationalGet(ctx context.Context, req *gnmipb.GetRequest, paths []*gnmipb.Path, prefix *gnmipb.Path) (*gnmipb.GetResponse, error) {
-	// Authentication - use gnoi auth even though this is a gNMI Get operation.
-	// The OPERATIONAL target provides operational state queries (like disk space)
-	// that supplement gNOI services when existing gNOI definitions don't provide
-	// what we need. This allows reusing gnoi_readonly/gnoi_readwrite roles
-	// for operational data access control.
-	authTarget := "gnoi"
-	ctx, err := authenticate(s.config, ctx, authTarget, false)
-	if err != nil {
-		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
-		return nil, err
-	}
-
+// performOperationalGetRead handles an already-authorized OPERATIONAL target request.
+func (s *Server) performOperationalGetRead(paths []*gnmipb.Path, prefix *gnmipb.Path) (*gnmipb.GetResponse, error) {
 	// Create operational handler
 	operationalHandler, err := operationalhandler.NewOperationalHandler(paths, prefix)
 	if err != nil {
@@ -950,105 +938,113 @@ func IsNativeOrigin(origin string) bool {
 }
 
 // Get implements the Get RPC in gNMI spec.
-func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetResponse, error) {
+func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (resp *gnmipb.GetResponse, retErr error) {
+	rc, ctx := common_utils.GetContext(ctx)
+	audit := defaultGNMIAuditLogger.newGetRecord(ctx, rc.ID, req, defaultGNMIAuditLogger.now())
+	defer defaultGNMIAuditLogger.finishGet(audit, &retErr)
+
 	common_utils.IncCounter(common_utils.GNMI_GET)
 
 	if req.GetType() != gnmipb.GetRequest_ALL {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		audit.Reason = reasonUnsupportedType
 		return nil, status.Errorf(codes.Unimplemented, "unsupported request type: %s", gnmipb.GetRequest_DataType_name[int32(req.GetType())])
-	}
-	// gNMI path based authorization
-	if s.config.PathzPolicy && len(req.GetPath()) != 0 {
-		newPaths := []*gnmipb.Path{}
-		user, err := getUsername(ctx)
-		if err != nil {
-			log.V(1).Infof("GetRequest User not found: %s", err.Error())
-			return nil, err
-		}
-		for _, path := range req.GetPath() {
-			// Only process the authorized paths in the request.
-			s.gnsiPathz.pathzProcessor.AuthorizeWithPrefix(user, req.GetPrefix(), path, gnsi_pathz_pb.Mode_MODE_READ)
-		}
-		if len(newPaths) == 0 {
-			return nil, status.Error(codes.PermissionDenied, "Unauthorized request. Rejected by pathz policy.")
-		}
-		req.Path = newPaths
 	}
 
 	if err := s.checkEncodingAndModel(req.GetEncoding(), req.GetUseModels()); err != nil {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		audit.Reason = reasonEncodingModelError
 		return nil, status.Error(codes.Unimplemented, err.Error())
 	}
 
-	target := ""
-	origin := ""
 	prefix := req.GetPrefix()
-	if prefix != nil {
-		target = prefix.GetTarget()
-		origin = prefix.Origin
-	}
-
 	paths := req.GetPath()
 	extensions := req.GetExtension()
 	encoding := req.GetEncoding()
 	log.V(2).Infof("GetRequest paths: %v", paths)
 
-	var dc sdc.Client
-	var err error
-	// Handle OPERATIONAL target directly without SONiC routing
-	if target == "OPERATIONAL" {
-		return s.handleOperationalGet(ctx, req, paths, prefix)
+	route, err := resolveGetRoute(req)
+	if err != nil {
+		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		audit.Reason = reasonClientCreateFailed
+		return nil, err
+	}
+	audit.Get.ClientType = route.clientType
+
+	ctx, err = authenticate(s.config, ctx, route.authTarget, false)
+	audit.stageAccess(rc.Auth.AuthEnabled, rc.Auth.User, transportValidatedPrincipal(ctx), audit.PeerType, err)
+	if err != nil {
+		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		audit.Reason = reasonAccessDenied
+		return nil, err
+	}
+	if rc.Auth.AuthEnabled && rc.Auth.User == "" {
+		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		err = status.Error(codes.Unauthenticated, "Authenticated user is unavailable")
+		audit.stageAccess(rc.Auth.AuthEnabled, rc.Auth.User, transportValidatedPrincipal(ctx), audit.PeerType, err)
+		audit.Reason = reasonAccessDenied
+		return nil, err
 	}
 
-	authTarget := "gnmi"
-	if target == "OTHERS" {
-		dc, err = sdc.NewNonDbClient(paths, prefix)
-		authTarget = "gnmi_other"
-	} else if target == "SHOW" {
-		dc, err = sdc.NewShowClient(paths, prefix)
-		authTarget = "gnmi_show"
-	} else if targetDbName, ok, _, _ := sdc.IsTargetDb(target); ok {
-		dc, err = sdc.NewDbClient(paths, prefix)
+	authorizedPaths := paths
+	if s.config.PathzPolicy {
+		authorizedPaths, audit.PathAuthzResult, err = authorizeGetRequest(s.gnsiPathz.pathzProcessor, rc.Auth.User, req)
+		audit.Get.AuthorizedPathCount = len(authorizedPaths)
+		if err != nil {
+			common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+			if audit.PathAuthzResult == getPathError {
+				audit.Reason = reasonPathPolicyError
+			} else {
+				audit.Reason = reasonPathPolicyDenied
+			}
+			return nil, err
+		}
+	} else {
+		audit.PathAuthzResult = getPathNotEnabled
+		audit.Get.AuthorizedPathCount = len(paths)
+	}
+
+	if route.clientType == clientOperational {
+		resp, err := s.performOperationalGetRead(authorizedPaths, prefix)
+		if err != nil {
+			audit.Reason = reasonBackendFailed
+		} else {
+			audit.Reason = reasonCompleted
+		}
+		return resp, err
+	}
+
+	var dc sdc.Client
+	switch route.clientType {
+	case clientNonDB:
+		dc, err = sdc.NewNonDbClient(authorizedPaths, prefix)
+	case clientShow:
+		dc, err = sdc.NewShowClient(authorizedPaths, prefix)
+	case clientDB:
+		dc, err = sdc.NewDbClient(authorizedPaths, prefix)
 		if err == nil {
-			// For Get requests, validate that all requested keys exist in Redis.
-			// NewDbClient allows non-existent paths (needed for Subscribe to monitor
-			// future data per gNMI spec), but Get should return NOT_FOUND immediately
-			// if any path doesn't exist (per gNMI spec Section 3.3.4).
 			if dbClient, ok := dc.(*sdc.DbClient); ok {
 				err = dbClient.ValidatePaths()
 			}
 		}
-		authTarget = "gnmi_" + targetDbName
-	} else {
-		if origin == "" {
-			origin, err = ParseOrigin(paths)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if check := IsNativeOrigin(origin); check {
-			var targetDbName string
-			dc, err = sdc.NewMixedDbClient(paths, prefix, origin, encoding, s.config.ZmqPort, s.config.Vrf, &targetDbName)
-			authTarget = "gnmi_" + targetDbName
-		} else {
-			dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions)
-		}
+	case clientNative:
+		var targetDbName string
+		dc, err = sdc.NewMixedDbClient(authorizedPaths, prefix, route.origin, encoding, s.config.ZmqPort, s.config.Vrf, &targetDbName)
+	default:
+		dc, err = sdc.NewTranslClient(prefix, authorizedPaths, ctx, extensions)
 	}
 
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		audit.Reason = reasonClientCreateFailed
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
 	defer dc.Close()
 
-	ctx, err = authenticate(s.config, ctx, authTarget, false)
-	if err != nil {
-		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
-		return nil, err
-	}
 	spbValues, err := dc.Get(nil)
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		audit.Reason = reasonBackendFailed
 		if st, ok := status.FromError(err); ok {
 			return nil, st.Err()
 		}
@@ -1068,6 +1064,7 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 			Update:    []*gnmipb.Update{update},
 		})
 	}
+	audit.Reason = reasonCompleted
 	return &gnmipb.GetResponse{Notification: notifications}, nil
 }
 

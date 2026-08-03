@@ -25,8 +25,11 @@ import (
 
 type fakeAuditSetClient struct {
 	sdc.Client
-	setErr   error
-	setCalls int
+	setErr    error
+	setCalls  int
+	getErr    error
+	getCalls  int
+	getValues []*spb.Value
 }
 
 func (c *fakeAuditSetClient) Set([]*gnmipb.Path, []*gnmipb.Update, []*gnmipb.Update) error {
@@ -42,10 +45,13 @@ func (c *fakeAuditSetClient) PollRun(*queue.PriorityQueue, chan struct{}, *sync.
 }
 func (c *fakeAuditSetClient) OnceRun(*queue.PriorityQueue, chan struct{}, *sync.WaitGroup, *gnmipb.SubscriptionList) {
 }
-func (c *fakeAuditSetClient) Get(*sync.WaitGroup) ([]*spb.Value, error) { return nil, nil }
-func (c *fakeAuditSetClient) Capabilities() []gnmipb.ModelData          { return nil }
-func (c *fakeAuditSetClient) FailedSend()                               {}
-func (c *fakeAuditSetClient) SentOne(*sdc.Value)                        {}
+func (c *fakeAuditSetClient) Get(*sync.WaitGroup) ([]*spb.Value, error) {
+	c.getCalls++
+	return c.getValues, c.getErr
+}
+func (c *fakeAuditSetClient) Capabilities() []gnmipb.ModelData { return nil }
+func (c *fakeAuditSetClient) FailedSend()                      {}
+func (c *fakeAuditSetClient) SentOne(*sdc.Value)               {}
 
 func TestSetAuditEarlyReturns(t *testing.T) {
 	tests := []struct {
