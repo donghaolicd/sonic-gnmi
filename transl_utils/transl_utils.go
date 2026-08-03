@@ -23,21 +23,9 @@ var (
 	Writer *syslog.Writer
 )
 
-var (
-	transLibOpMap map[int]string
-)
-
 type TranslibGetFunc func(translib.GetRequest) (translib.GetResponse, error)
 
 var translibGet TranslibGetFunc = translib.Get
-
-func init() {
-	transLibOpMap = map[int]string{
-		translib.REPLACE: "REPLACE",
-		translib.UPDATE:  "UPDATE",
-		translib.DELETE:  "DELETE",
-	}
-}
 
 func __log_audit_msg(ctx context.Context, reqType string, uriPath string, err error) {
 	var err1 error
@@ -410,7 +398,6 @@ func TranslProcessBulk(delete []*gnmipb.Path, replace []*gnmipb.Update, update [
 	resp, err = translib.Bulk(br)
 
 	for k := range resp.Response {
-		__log_audit_msg(ctx, transLibOpMap[resp.Response[k].Operation], br.Request[k].Entry.Path, resp.Response[k].Entry.Err)
 		if resp.Response[k].Entry.Err != nil {
 			log.Warningf("%s=%v", resp.Response[k].Entry.Err.Error(), resp.Response[k].Entry.ErrSrc)
 			errors = append(errors, resp.Response[k].Entry.Err.Error())
