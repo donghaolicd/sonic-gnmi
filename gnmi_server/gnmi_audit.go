@@ -425,6 +425,20 @@ func redactAuditPath(prefix, path *gnmipb.Path) string {
 	if len(elems) == 0 {
 		return "/"
 	}
+	target := strings.Split(prefix.GetTarget(), "/")[0]
+	origin := prefix.GetOrigin()
+	if origin == "" {
+		origin = path.GetOrigin()
+	}
+	if strings.HasSuffix(target, "_DB") {
+		return "/" + elems[0].GetName()
+	}
+	if origin == "sonic-db" {
+		if len(elems) >= 3 {
+			return "/" + elems[0].GetName() + "/" + elems[2].GetName()
+		}
+		return "/" + elems[0].GetName()
+	}
 	var builder strings.Builder
 	for _, elem := range elems {
 		builder.WriteByte('/')

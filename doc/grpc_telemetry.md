@@ -11,6 +11,7 @@
          * [Poll mode](#poll-mode)
       * [Virtual path](#virtual-path)
    * [Authentication](#authentication)
+   * [Get and Set security accounting](#get-and-set-security-accounting)
    * [Encryption](#encryption)
    * [AutoTest](#autotest)
    * [Performance and Scale Test](#performance-and-scale-test)
@@ -67,6 +68,30 @@ For data not available in DBs, Target name "OTHERS" is designated for that categ
 # SONiC system telemetry software architecture
 System telemetry in SONiC supports both dial-in mode and dial-out mode. The DB client takes care of retrieving data from SONiC redis database, while non-DB client serves data outside of redis databases. gRPC dial-in server (gNMI server) is described in this document,
 ![SOFTWARE ARCHITECTURE](img/dial_in_out.png)
+
+# Get and Set security accounting
+
+The gNMI server emits one unsampled `GNMI_AUDIT` completion record for every
+dispatched Get or Set RPC. The versioned JSON record includes the method,
+request identifier, validated principal or explicit identity state,
+authorization outcome, final gRPC code, duration, operation counts, and a
+redacted path shape.
+
+Audit records never include request or response values, path key names or
+values, credentials, tokens, certificate contents, roles, arbitrary backend
+errors, or panic values. Database paths retain only the table-level shape;
+OpenConfig paths retain element names while key maps are omitted.
+
+The server writes these records through syslog `LOG_AUTHPRIV` with application
+identifier `gnmi-audit`. On a SONiC host, container log forwarding renders the
+program name as `gnmi#gnmi-audit` with an optional process ID suffix and routes
+the record to `/var/log/auth.log`. The `RPC_ACCESS` record is separate,
+rate-limited operational telemetry and does not replace this security
+accounting signal.
+
+The initiative and acceptance criteria are tracked in
+[ADO work item 39044522](https://msazure.visualstudio.com/One/_workitems/edit/39044522).
+
 # gRPC operations for system telemetry in SONiC
 As mentioned at the beginning, SONiC gRPC data telemetry is largely based on gNMI protocol,  the GetRquest/GetResponse and SubscribeRequest/SubscribeResponse RPC have been implemented. Since SONiC doesn't have complete YANG data model yet, the DB, TABLE, KEY and Field path hierarchy is used as path to uniquely identify the configuration/state and counter data.
 

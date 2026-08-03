@@ -244,6 +244,43 @@ func TestGNMIAuditPathCapAndTruncation(t *testing.T) {
 	}
 }
 
+func TestGNMIAuditDatabasePathRedaction(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefix *gnmipb.Path
+		path   *gnmipb.Path
+		want   string
+	}{
+		{
+			name:   "direct DB omits positional key and field",
+			prefix: &gnmipb.Path{Target: "CONFIG_DB"},
+			path: &gnmipb.Path{Elem: []*gnmipb.PathElem{
+				{Name: "DEVICE_METADATA"}, {Name: "SECRET_KEY"}, {Name: "SECRET_FIELD"},
+			}},
+			want: "/DEVICE_METADATA",
+		},
+		{
+			name:   "native DB keeps database and table only",
+			prefix: &gnmipb.Path{Origin: "sonic-db"},
+			path: &gnmipb.Path{Elem: []*gnmipb.PathElem{
+				{Name: "CONFIG_DB"}, {Name: "SECRET_INSTANCE"}, {Name: "PORT"}, {Name: "SECRET_KEY"},
+			}},
+			want: "/CONFIG_DB/PORT",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactAuditPath(tc.prefix, tc.path)
+			if got != tc.want {
+				t.Fatalf("redactAuditPath() = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, "SECRET") {
+				t.Fatalf("redacted path leaked positional key: %q", got)
+			}
+		})
+	}
+}
+
 func TestGNMIAuditLoggerFailureAndReconnect(t *testing.T) {
 	t.Run("marshal failure is counted without calling sink", func(t *testing.T) {
 		writer := &auditTestWriter{}
