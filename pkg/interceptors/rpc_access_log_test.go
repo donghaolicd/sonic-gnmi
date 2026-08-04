@@ -515,3 +515,266 @@ func TestRPCLoggerUnarySuccess(t *testing.T) {
 		t.Fatalf("duration_ms = %d, want non-negative", got.DurationMS)
 	}
 }
+
+// — TEST-029 (EPIC-010/rate-limiter-config): rpcKeyedLimiter isolation tests —
+
+// TestRPCKeyedLimiterZeroIntervalAllowsAll verifies that a zero interval
+// (disabled) allows all events and creates no key state (TEST-029).
+func TestRPCKeyedLimiterZeroIntervalAllowsAll(t *testing.T) {
+	lim := &rpcKeyedLimiter{
+		interval: 0,
+		burst:    1,
+		now:      time.Now,
+		maxKeys:  100,
+		limits:   make(map[rpcLogKey]*rpcLogLimit),
+	}
+	key := rpcLogKey{method: "/gnmi.gNMI/Get", code: codes.OK}
+	for i := range 50 {
+		_, allowed, scheduleNeeded := lim.allow(key)
+		if !allowed {
+			t.Fatalf("call %d: zero-interval limiter suppressed an event", i+1)
+		}
+		if scheduleNeeded {
+			t.Fatalf("call %d: zero-interval limiter requested a summary schedule", i+1)
+		}
+	}
+	if len(lim.limits) != 0 {
+		t.Fatalf("zero-interval limiter: map has %d entries, want 0", len(lim.limits))
+	}
+}
+
+// TestRPCKeyedLimiterZeroBurstAllowsAll verifies that a zero burst (disabled)
+// allows all events and creates no key state (TEST-029).
+func TestRPCKeyedLimiterZeroBurstAllowsAll(t *testing.T) {
+	lim := &rpcKeyedLimiter{
+		interval: 10 * time.Second,
+		burst:    0,
+		now:      time.Now,
+		maxKeys:  100,
+		limits:   make(map[rpcLogKey]*rpcLogLimit),
+	}
+	key := rpcLogKey{method: "/gnmi.gNMI/Get", code: codes.OK}
+	for i := range 50 {
+		_, allowed, scheduleNeeded := lim.allow(key)
+		if !allowed {
+			t.Fatalf("call %d: zero-burst limiter suppressed an event", i+1)
+		}
+		if scheduleNeeded {
+			t.Fatalf("call %d: zero-burst limiter requested a summary schedule", i+1)
+		}
+	}
+	if len(lim.limits) != 0 {
+		t.Fatalf("zero-burst limiter: map has %d entries, want 0", len(lim.limits))
+	}
+}
+
+// TestRPCKeyedLimiterNonZeroParity verifies that a non-zero default construction
+// (10 s interval, burst 1) produces the same rate-limiting behavior as the
+// pre-extraction rpcLogger (TEST-029).
+func TestRPCKeyedLimiterNonZeroParity(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 0, 0, 0, 0, time.UTC)
+	lim := &rpcKeyedLimiter{
+		interval: rpcAccessLogInterval,
+		burst:    1,
+		now:      func() time.Time { return now },
+		maxKeys:  rpcKeyedLimiterMaxKeys,
+		limits:   make(map[rpcLogKey]*rpcLogLimit),
+	}
+	key := rpcLogKey{method: "/gnmi.gNMI/Get", code: codes.OK}
+
+	_, allowed, _ := lim.allow(key)
+	if !allowed {
+		t.Fatal("first call should be allowed")
+	}
+	for i := range 3 {
+		_, allowed, _ := lim.allow(key)
+		if allowed {
+			t.Fatalf("call %d within interval should be suppressed", i+2)
+		}
+	}
+
+	now = now.Add(rpcAccessLogInterval)
+	suppressed, allowed, _ := lim.allow(key)
+	if !allowed {
+		t.Fatal("call after interval should be allowed")
+	}
+	if suppressed != 3 {
+		t.Fatalf("suppressed = %d, want 3", suppressed)
+	}
+
+	other := rpcLogKey{method: "/gnmi.gNMI/Get", code: codes.PermissionDenied}
+	_, allowed, _ = lim.allow(other)
+	if !allowed {
+		t.Fatal("different method+code pair should be tracked independently")
+	}
+}
+
+// TestRPCKeyedLimiterConcurrentRaceFree verifies that concurrent callers are
+// race-free and that exactly burst=1 events are allowed at the same instant
+// (TEST-029).
+func TestRPCKeyedLimiterConcurrentRaceFree(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 0, 0, 0, 0, time.UTC)
+	var countMu sync.Mutex
+	var allowedCount int
+	lim := &rpcKeyedLimiter{
+		interval: rpcAccessLogInterval,
+		burst:    1,
+		now:      func() time.Time { return now },
+		maxKeys:  rpcKeyedLimiterMaxKeys,
+		limits:   make(map[rpcLogKey]*rpcLogLimit),
+	}
+	key := rpcLogKey{method: "/gnmi.gNMI/Get", code: codes.OK}
+
+	const goroutines = 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			_, ok, _ := lim.allow(key)
+			if ok {
+				countMu.Lock()
+				allowedCount++
+				countMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if allowedCount != 1 {
+		t.Fatalf("concurrent callers: %d allowed, want exactly 1 (burst=1)", allowedCount)
+	}
+}
+
+// TestRPCKeyedLimiterBoundedMaxKeys verifies that the key-state map is capped
+// at maxKeys and that events for over-cap keys are allowed without tracking
+// (TEST-029 bounded key state).
+func TestRPCKeyedLimiterBoundedMaxKeys(t *testing.T) {
+	const keyCap = 5
+	now := time.Date(2026, time.July, 27, 0, 0, 0, 0, time.UTC)
+	lim := &rpcKeyedLimiter{
+		interval: rpcAccessLogInterval,
+		burst:    1,
+		now:      func() time.Time { return now },
+		maxKeys:  keyCap,
+		limits:   make(map[rpcLogKey]*rpcLogLimit),
+	}
+
+	for i := range keyCap {
+		key := rpcLogKey{method: fmt.Sprintf("/m%d", i), code: codes.OK}
+		_, allowed, _ := lim.allow(key)
+		if !allowed {
+			t.Fatalf("key %d: want allowed, got suppressed", i)
+		}
+	}
+	if len(lim.limits) != keyCap {
+		t.Fatalf("map size = %d, want %d after filling to cap", len(lim.limits), keyCap)
+	}
+
+	// Keys beyond capacity are allowed without being tracked.
+	for i := keyCap; i < keyCap+10; i++ {
+		key := rpcLogKey{method: fmt.Sprintf("/m%d", i), code: codes.OK}
+		_, allowed, _ := lim.allow(key)
+		if !allowed {
+			t.Fatalf("over-cap key %d: want allowed (no-track fallback), got suppressed", i)
+		}
+	}
+	if len(lim.limits) != keyCap {
+		t.Fatalf("map grew past cap: size = %d, want %d", len(lim.limits), keyCap)
+	}
+}
+
+// — TEST-030 (EPIC-010/clock-injection): deterministic clock tests —
+
+// TestRPCKeyedLimiterClockAdvance verifies deterministic clock-advance:
+// suppressed count accumulates correctly, advancing past the interval allows
+// the event and returns the accumulated count (TEST-030).
+func TestRPCKeyedLimiterClockAdvance(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 0, 0, 0, 0, time.UTC)
+	lim := &rpcKeyedLimiter{
+		interval: rpcAccessLogInterval,
+		burst:    1,
+		now:      func() time.Time { return now },
+		maxKeys:  rpcKeyedLimiterMaxKeys,
+		limits:   make(map[rpcLogKey]*rpcLogLimit),
+	}
+	key := rpcLogKey{method: "/gnmi.gNMI/Get", code: codes.OK}
+
+	suppressed, allowed, needSchedule := lim.allow(key)
+	if !allowed || suppressed != 0 || needSchedule {
+		t.Fatalf("first allow = (%d, %v, %v), want (0, true, false)", suppressed, allowed, needSchedule)
+	}
+
+	const suppressCount = 5
+	for i := range suppressCount {
+		suppressed, allowed, needSchedule := lim.allow(key)
+		if allowed || suppressed != 0 {
+			t.Fatalf("suppressed call %d: allow = (%d, %v), want (0, false)", i+1, suppressed, allowed)
+		}
+		if i == 0 && !needSchedule {
+			t.Fatal("first suppressed call: want scheduleNeeded=true")
+		}
+		if i > 0 && needSchedule {
+			t.Fatalf("subsequent suppressed call %d: want scheduleNeeded=false", i+1)
+		}
+	}
+
+	now = now.Add(rpcAccessLogInterval)
+	suppressed, allowed, needSchedule = lim.allow(key)
+	if !allowed {
+		t.Fatal("call after interval should be allowed")
+	}
+	if suppressed != suppressCount {
+		t.Fatalf("suppressed = %d, want %d", suppressed, suppressCount)
+	}
+	if needSchedule {
+		t.Fatal("allowed call should not request a schedule")
+	}
+}
+
+// TestRPCKeyedLimiterFlushSummary verifies flushSummary behavior via injected
+// clock: reschedules when the interval has not elapsed, emits when it has, and
+// is a no-op when suppressed count is already zero (TEST-030).
+func TestRPCKeyedLimiterFlushSummary(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 0, 0, 0, 0, time.UTC)
+	lim := &rpcKeyedLimiter{
+		interval: rpcAccessLogInterval,
+		burst:    1,
+		now:      func() time.Time { return now },
+		maxKeys:  rpcKeyedLimiterMaxKeys,
+		limits:   make(map[rpcLogKey]*rpcLogLimit),
+	}
+	key := rpcLogKey{method: "/gnmi.gNMI/Get", code: codes.OK}
+
+	// No key in map → no-op.
+	suppressed, emitted, reschedule := lim.flushSummary(key)
+	if suppressed != 0 || emitted || reschedule {
+		t.Fatalf("flushSummary on absent key = (%d, %v, %v), want (0, false, false)", suppressed, emitted, reschedule)
+	}
+
+	// Allow one event (token consumed), suppress one more.
+	lim.allow(key) // allowed
+	lim.allow(key) // suppressed; suppressed=1, scheduled=true
+
+	// Flush before interval: token unavailable → reschedule.
+	suppressed, emitted, reschedule = lim.flushSummary(key)
+	if suppressed != 0 || emitted || !reschedule {
+		t.Fatalf("flushSummary before interval = (%d, %v, %v), want (0, false, true)", suppressed, emitted, reschedule)
+	}
+
+	// Advance past interval; flush should emit the summary.
+	now = now.Add(rpcAccessLogInterval)
+	suppressed, emitted, reschedule = lim.flushSummary(key)
+	if !emitted || reschedule {
+		t.Fatalf("flushSummary after interval: emitted=%v reschedule=%v, want (true, false)", emitted, reschedule)
+	}
+	if suppressed != 1 {
+		t.Fatalf("flushSummary suppressed = %d, want 1", suppressed)
+	}
+
+	// A second flush finds suppressed=0 → no-op.
+	suppressed, emitted, reschedule = lim.flushSummary(key)
+	if suppressed != 0 || emitted || reschedule {
+		t.Fatalf("second flushSummary = (%d, %v, %v), want (0, false, false)", suppressed, emitted, reschedule)
+	}
+}

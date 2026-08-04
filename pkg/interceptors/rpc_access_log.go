@@ -16,20 +16,13 @@ const (
 	rpcAccessLogPrefix        = "RPC_ACCESS"
 	rpcAccessLogSummaryPrefix = "RPC_ACCESS_SUMMARY"
 	rpcAccessLogInterval      = 10 * time.Second
+
+	// rpcKeyedLimiterMaxKeys caps the key-state map to prevent unbounded growth.
+	rpcKeyedLimiterMaxKeys = 10_000
 )
 
 type logfFunc func(string, ...interface{})
 type scheduleFunc func(time.Duration, func())
-
-// rpcLogger emits at most one access record or suppression summary per method
-// and status-code pair during each interval.
-type rpcLogger struct {
-	logf     logfFunc
-	now      func() time.Time
-	schedule scheduleFunc
-	mu       sync.Mutex
-	limits   map[rpcLogKey]*rpcLogLimit
-}
 
 type rpcLogKey struct {
 	method string
@@ -40,6 +33,103 @@ type rpcLogLimit struct {
 	limiter    *rate.Limiter
 	suppressed uint64
 	scheduled  bool
+}
+
+// rpcKeyedLimiter is a configurable per-(method,code) rate limiter with
+// zero/off semantics, bounded key state, and an injectable clock.
+//
+// PROHIBITION (RD-032): This limiter and any derived configuration MUST NOT be
+// applied to GNMI_AUDIT events or any security-required event class. Doing so
+// would violate NFR-001 (GNMI_AUDIT events must be unsampled) and FR-003 (one
+// record per handler invocation). Any change requires a formal
+// security-requirements update in ADO #39044522 and explicit
+// security-owner approval.
+type rpcKeyedLimiter struct {
+	interval time.Duration
+	burst    int
+	now      func() time.Time
+	maxKeys  int
+	mu       sync.Mutex
+	limits   map[rpcLogKey]*rpcLogLimit
+}
+
+// allow reports whether the event for key should be logged.
+//
+// Returns (suppressed, allowed, scheduleNeeded):
+//   - suppressed: count of events suppressed since the last allowed event
+//   - allowed: whether this event should be logged
+//   - scheduleNeeded: caller must schedule a summary flush if true
+//
+// When interval<=0 or burst<=0 (disabled), all events are allowed without
+// creating any key state (zero/off semantics).
+// When the map is at maxKeys capacity and the key is new, the event is allowed
+// without tracking (cap fallback).
+func (lim *rpcKeyedLimiter) allow(key rpcLogKey) (suppressed uint64, allowed bool, scheduleNeeded bool) {
+	if lim.interval <= 0 || lim.burst <= 0 {
+		return 0, true, false
+	}
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+
+	limit, ok := lim.limits[key]
+	if !ok {
+		if len(lim.limits) >= lim.maxKeys {
+			return 0, true, false
+		}
+		limit = &rpcLogLimit{
+			limiter: rate.NewLimiter(rate.Every(lim.interval), lim.burst),
+		}
+		lim.limits[key] = limit
+	}
+	if !limit.limiter.AllowN(lim.now(), 1) {
+		limit.suppressed++
+		needSchedule := !limit.scheduled
+		if needSchedule {
+			limit.scheduled = true
+		}
+		return 0, false, needSchedule
+	}
+	suppressed = limit.suppressed
+	limit.suppressed = 0
+	return suppressed, true, false
+}
+
+// flushSummary attempts to emit a suppression summary for key.
+//
+// Returns (suppressed, emitted, reschedule):
+//   - suppressed: count of suppressed events (valid only when emitted=true)
+//   - emitted: true if a summary record should be written
+//   - reschedule: true if the caller must reschedule the summary flush
+//
+// If the key is absent or suppressed count is zero, all return values are zero.
+func (lim *rpcKeyedLimiter) flushSummary(key rpcLogKey) (suppressed uint64, emitted bool, reschedule bool) {
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+
+	limit, ok := lim.limits[key]
+	if !ok {
+		return 0, false, false
+	}
+	limit.scheduled = false
+	if limit.suppressed == 0 {
+		return 0, false, false
+	}
+	if !limit.limiter.AllowN(lim.now(), 1) {
+		limit.scheduled = true
+		return 0, false, true
+	}
+	suppressed = limit.suppressed
+	limit.suppressed = 0
+	return suppressed, true, false
+}
+
+// rpcLogger emits at most one access record or suppression summary per method
+// and status-code pair during each interval.
+type rpcLogger struct {
+	logf     logfFunc
+	now      func() time.Time
+	schedule scheduleFunc
+	limiter  *rpcKeyedLimiter
 }
 
 type rpcAccessLogRecord struct {
@@ -71,14 +161,20 @@ func newRPCLoggerWithClock(logf logfFunc, now func() time.Time, schedule schedul
 		logf:     logf,
 		now:      now,
 		schedule: schedule,
-		limits:   make(map[rpcLogKey]*rpcLogLimit),
+		limiter: &rpcKeyedLimiter{
+			interval: rpcAccessLogInterval,
+			burst:    1,
+			now:      now,
+			maxKeys:  rpcKeyedLimiterMaxKeys,
+			limits:   make(map[rpcLogKey]*rpcLogLimit),
+		},
 	}
 }
 
 func (l *rpcLogger) log(ctx context.Context, rpcType, method string, started time.Time, err error) {
 	finished := l.now()
 	code := logging.GRPCCode(err)
-	suppressed, allowed := l.allow(method, code, finished)
+	suppressed, allowed := l.allow(method, code)
 	if !allowed {
 		return
 	}
@@ -97,53 +193,24 @@ func (l *rpcLogger) log(ctx context.Context, rpcType, method string, started tim
 	}, sink)
 }
 
-func (l *rpcLogger) allow(method string, code codes.Code, now time.Time) (uint64, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+func (l *rpcLogger) allow(method string, code codes.Code) (uint64, bool) {
 	key := rpcLogKey{method: method, code: code}
-	limit, ok := l.limits[key]
-	if !ok {
-		limit = &rpcLogLimit{
-			limiter: rate.NewLimiter(rate.Every(rpcAccessLogInterval), 1),
-		}
-		l.limits[key] = limit
+	suppressed, allowed, scheduleNeeded := l.limiter.allow(key)
+	if scheduleNeeded {
+		l.schedule(rpcAccessLogInterval, func() { l.writeSummary(key) })
 	}
-	if !limit.limiter.AllowN(now, 1) {
-		limit.suppressed++
-		l.scheduleSummary(key, limit)
-		return 0, false
-	}
-	suppressed := limit.suppressed
-	limit.suppressed = 0
-	return suppressed, true
-}
-
-func (l *rpcLogger) scheduleSummary(key rpcLogKey, limit *rpcLogLimit) {
-	if limit.scheduled {
-		return
-	}
-	limit.scheduled = true
-	l.schedule(rpcAccessLogInterval, func() { l.writeSummary(key) })
+	return suppressed, allowed
 }
 
 func (l *rpcLogger) writeSummary(key rpcLogKey) {
-	l.mu.Lock()
-	limit := l.limits[key]
-	limit.scheduled = false
-	if limit.suppressed == 0 {
-		l.mu.Unlock()
+	suppressed, emitted, reschedule := l.limiter.flushSummary(key)
+	if reschedule {
+		l.schedule(rpcAccessLogInterval, func() { l.writeSummary(key) })
 		return
 	}
-	if !limit.limiter.AllowN(l.now(), 1) {
-		l.scheduleSummary(key, limit)
-		l.mu.Unlock()
+	if !emitted {
 		return
 	}
-	suppressed := limit.suppressed
-	limit.suppressed = 0
-	l.mu.Unlock()
-
 	sink := func(line string) error { l.logf("%s", line); return nil }
 	_ = logging.WriteJSON(rpcAccessLogSummaryPrefix, rpcAccessLogSummary{
 		Version:    1,
