@@ -21,6 +21,7 @@ import (
 
 	gnmi "github.com/sonic-net/sonic-gnmi/gnmi_server"
 	"github.com/sonic-net/sonic-gnmi/pkg/interceptors"
+	"github.com/sonic-net/sonic-gnmi/pkg/stagetiming"
 	testcert "github.com/sonic-net/sonic-gnmi/testdata/tls"
 
 	"github.com/fsnotify/fsnotify"
@@ -562,7 +563,7 @@ func startGNMIServer(telemetryCfg *TelemetryConfig, cfg *gnmi.Config, serverCont
 			}
 			commonOpts = append(commonOpts, grpc.KeepaliveEnforcementPolicy(keep_alive_policy))
 
-			tlsOpts = []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
+			tlsOpts = []grpc.ServerOption{grpc.Creds(stagetiming.WrapCredentials(credentials.NewTLS(tlsCfg)))}
 
 			if *telemetryCfg.IdleConnDuration > 0 { // non inf case
 				commonOpts = append(commonOpts, grpc.KeepaliveParams(keep_alive_params))

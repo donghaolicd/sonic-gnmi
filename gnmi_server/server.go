@@ -22,6 +22,7 @@ import (
 	gnsi_pathz_pb "github.com/openconfig/gnsi/pathz"
 	"github.com/sonic-net/sonic-gnmi/common_utils"
 	"github.com/sonic-net/sonic-gnmi/pkg/bypass"
+	"github.com/sonic-net/sonic-gnmi/pkg/stagetiming"
 	operationalhandler "github.com/sonic-net/sonic-gnmi/pkg/server/operational-handler"
 	spb "github.com/sonic-net/sonic-gnmi/proto"
 	spb_gnoi "github.com/sonic-net/sonic-gnmi/proto/gnoi"
@@ -506,7 +507,7 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 	if err != nil {
 		return nil, nil, err
 	}
-	return []grpc.ServerOption{grpc.Creds(serverCreds)}, providers, nil
+	return []grpc.ServerOption{grpc.Creds(stagetiming.WrapCredentials(serverCreds))}, providers, nil
 }
 
 // NewServer returns an initialized Server.
@@ -545,6 +546,7 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 		return nil, errors.New("config not provided")
 	}
 	var providers []certprovider.Provider
+	commonOpts = append(stagetiming.Options(), commonOpts...)
 	common_utils.InitCounters()
 
 	// Set authorization policy.
@@ -1184,7 +1186,9 @@ func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetRe
 	}
 	defer dc.Close()
 
+	finishAuth := stagetiming.Phase(ctx, "set_authentication")
 	ctx, err = authenticate(s.config, ctx, authTarget, true)
+	finishAuth()
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
 		return nil, err
@@ -1225,7 +1229,9 @@ func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetRe
 		/* Add to Set response results. */
 		results = append(results, &res)
 	}
+	finishSet := stagetiming.Phase(ctx, "native_backend_set")
 	err = dc.Set(req.GetDelete(), req.GetReplace(), req.GetUpdate())
+	finishSet()
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
 	} else {
